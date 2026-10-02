@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      4.0.6
+// @version      4.0.7
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       1115yt
 // @license      GPL3
@@ -38,7 +38,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '4.0.6',     // 版本号
+    version: '4.0.7',     // 版本号
     playbackRate: 1,      // 视频播放倍速
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -2106,6 +2106,12 @@
     isCurrentCompleted() {
       // 仅检查当前单元的状态，不能用整门课程或其他讨论的状态判断。
       if (AiWorkspace.getRoute()) {
+        // 讨论页的“已发言”位于单元控制栏，不在视频的完成度区域。
+        const headerStatuses = [...document.querySelectorAll('.learning-space-control-unit .control-right > div')]
+          .filter(node => AiWorkspace.isVisibleElement(node))
+          .map(node => AiWorkspace.normalizeText(node.innerText || ''))
+          .filter(text => /^(已发言|未发言|已完成|未完成|已读|未读|已提交|未提交|进行中)$/.test(text));
+        if (headerStatuses.length) return headerStatuses.every(text => this.isCompletedStatus(text));
         const statuses = [...document.querySelectorAll('.rate-detail .text')]
           .filter(node => AiWorkspace.isVisibleElement(node))
           .map(node => node.innerText || '').filter(text => text.trim());
