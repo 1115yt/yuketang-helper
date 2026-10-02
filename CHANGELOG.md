@@ -1,6 +1,8 @@
-# v4.0.4 更新说明
+# v4.0.5 更新说明
 
 本项目基于 [Niuwh/yuketang-jiaoben](https://github.com/Niuwh/yuketang-jiaoben) 修改维护。上游 main 分支的 [原脚本](https://github.com/Niuwh/yuketang-jiaoben/blob/main/yuketang.js) 标注版本 3.0.6、作者“风之子”和 GPL3。当前修改维护账号为 1115yt；上游作者与历史贡献者仍归属原项目。
+
+本版修复已读或已完成的讨论仍重复进入回复流程的问题，并将脚本版本递增至 4.0.5，供 Tampermonkey 识别更新。
 
 ## 本版功能
 

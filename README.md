@@ -1,6 +1,6 @@
 # 雨课堂学习辅助脚本
 
-当前版本：4.0.4
+当前版本：4.0.5
 
 本项目基于 [Niuwh/yuketang-jiaoben](https://github.com/Niuwh/yuketang-jiaoben) 修改维护，主要差异见 [CHANGELOG.md](CHANGELOG.md)。
 
