@@ -2085,6 +2085,21 @@
 
   // 讨论回复：只在开关开启时复制已有回答；发送后检查新增评论或成功反馈。
   const Discussion = {
+    isCompletedStatus(text) {
+      const status = AiWorkspace.normalizeText(text || '');
+      return !/未完成|未提交|未读|未开始|进行中/.test(status)
+        && (Utils.isProgressDone(status) || status.includes('已读'));
+    },
+    isCurrentCompleted() {
+      // 仅检查当前单元的状态，不能用整门课程或其他讨论的状态判断。
+      if (AiWorkspace.getRoute()) {
+        const statuses = [...document.querySelectorAll('.rate-detail .text')]
+          .filter(node => AiWorkspace.isVisibleElement(node))
+          .map(node => node.innerText || '').filter(text => text.trim());
+        return statuses.length > 0 && statuses.every(text => this.isCompletedStatus(text));
+      }
+      return this.isCompletedStatus(document.querySelector('section.title')?.lastElementChild?.innerText);
+    },
     comments(doc) {
       return [...doc.querySelectorAll('.module-forum .forum-content .forum-item .publish-forum-topic > .comment-text, #new_discuss .cont_detail, .new_discuss_list .cont_detail, .cont_detail.word-break, .comment-content, .reply-content, [class*="comment-content"]')]
         .filter(el => AiWorkspace.isVisibleElement(el) && (el.innerText || '').trim());
@@ -2152,6 +2167,10 @@
       return null;
     },
     async copyAndSubmit() {
+      if (this.isCurrentCompleted()) {
+        panel.log('当前讨论已完成／已读，跳过；未发表评论');
+        return { ok: true, status: 'already_completed' };
+      }
       const recordKey = 'ykt_comment_confirmed:' + location.origin + location.pathname + location.search;
       if (GM_getValue(recordKey, false)) {
         panel.log('此页面有已确认回复记录，本轮不重复发送');
@@ -2509,7 +2528,7 @@
         // 判断是否已完成
         let isCompleted = this.checkCompletionStatus(statusBox, statusText);
 
-        if (isCompleted && !(Store.getFeatureConf().autoComment && /taolun/.test(type))) {
+        if (isCompleted) {
           this.panel.log(`✅ ${title} 已完成，跳过`);
           this.updateProgress(this.outside + 1, 0);
           continue;
@@ -2592,7 +2611,7 @@
         const statusText = statusBox?.innerText || '';
         const isCompleted = this.checkCompletionStatus(statusBox, statusText);
 
-        if (isCompleted && !(Store.getFeatureConf().autoComment && /taolun/.test(tagHref))) {
+        if (isCompleted) {
           this.panel.log(`✅ ${title} 已完成，跳过`);
           idx++;
           this.updateProgress(this.outside, idx);
@@ -2640,9 +2659,11 @@
     async autoCommentItem(item, typeText, idx) {
       if (await this.clickAndCheckHandoff(item)) return idx;
       await Utils.sleep(1200);
-      if (Store.getFeatureConf().autoComment) {
-        Solver.requireResult(await Discussion.copyAndSubmit());
-        this.panel.log(typeText + '区已确认发表评论');
+      if (Discussion.isCurrentCompleted()) {
+        this.panel.log(typeText + '已完成／已读，跳过；未发表评论');
+      } else if (Store.getFeatureConf().autoComment) {
+        const result = Solver.requireResult(await Discussion.copyAndSubmit());
+        this.panel.log(result.status === 'commented' ? typeText + '区已确认发表评论' : typeText + '已有完成或回复记录，跳过');
       } else { this.panel.log(typeText + '已查看；自动回复关闭，未发表评论'); }
       this.updateProgress(this.outside, idx + 1);
       history.back();
@@ -2800,9 +2821,11 @@
           await Player.playAndConfirm(document.querySelector('video'), () => this.readStatus());
           this.panel.log(className + ' 已确认完成');
         } else if (classType.includes('taolun')) {
-          if (Store.getFeatureConf().autoComment) {
-            Solver.requireResult(await Discussion.copyAndSubmit());
-            this.panel.log(className + ' 已确认发表评论');
+          if (Discussion.isCompletedStatus(this.readStatus())) {
+            this.panel.log(className + ' 已完成／已读，跳过；未发表评论');
+          } else if (Store.getFeatureConf().autoComment) {
+            const result = Solver.requireResult(await Discussion.copyAndSubmit());
+            this.panel.log(result.status === 'commented' ? className + ' 已确认发表评论' : className + ' 已有完成或回复记录，跳过');
           } else { this.panel.log('自动回复关闭，跳过讨论（未发表评论）'); }
         } else if (classType.includes('tuwen') && !this.readStatus().includes('已读')) {
           await Utils.requirePoll(() => this.readStatus().includes('已读'), { interval: 500, timeout: 15000 }, '图文未显示已读状态');
@@ -3059,8 +3082,9 @@
       } else if (route.type === 'exercise') {
         ok = await this.handleExercise(route);
       } else if (/^(forum|discussion|discuss|taolun|text|tuwen)$/.test(route.type)) {
-        if (Store.getFeatureConf().autoComment) Solver.requireResult(await Discussion.copyAndSubmit());
-        else if (/^(forum|discussion|discuss|taolun)$/.test(route.type)) throw new Error('当前为讨论页面，请在设置中开启自动复制已有回答并回复；保留当前位置');
+        if (Discussion.isCurrentCompleted()) this.panel.log('当前项目已完成／已读，跳过；未发表评论');
+        else if (Store.getFeatureConf().autoComment) Solver.requireResult(await Discussion.copyAndSubmit());
+        else if (/^(forum|discussion|discuss|taolun)$/.test(route.type)) this.panel.log('自动回复关闭，跳过讨论（未发表评论）');
         else this.panel.log('自动回复关闭，跳过图文（未发表评论）');
         ok = true;
       } else {
