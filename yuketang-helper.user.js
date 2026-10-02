@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      4.0.7
+// @version      4.0.8
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       1115yt
 // @license      GPL3
@@ -38,7 +38,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '4.0.7',     // 版本号
+    version: '4.0.8',     // 版本号
     playbackRate: 1,      // 视频播放倍速
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -621,7 +621,8 @@
               <div id="settings">
                 <div class="form-item"><label>AI 识题方式：</label><select id="answer_input_mode"><option value="image">截图识题（需要支持图片的模型）</option><option value="ocr">OCR 文字识题</option></select></div>
                 <div class="form-item" style="font-size:12px">OCR 识图不保证正确率，可能误识别文字或丢失空格位置。截图识题请选择支持识图的大模型，图片将发送至你配置的 AI 接口；截图识题也不保证答案正确。</div>
-                <div class="form-item"><label>每题开始前等待（秒，0～300）：</label><input id="answer_interval" type="number" min="0" max="300" step="1"></div>
+                <div class="form-item"><label>每题开始前等待（秒，0～300）：</label><input id="answer_interval" type="number" min="0" max="300" step="1" aria-describedby="answer_interval_notice"></div>
+                <div id="answer_interval_notice" class="form-item" style="font-size:12px">建议设置为3秒以上，以降低操作过快触发验证码的概率，但不能保证完全避免验证码。跳过已提交题目也按此设置等待，最少3秒。</div>
                 <div class="form-item"><label>提交前等待（秒，0～60）：</label><input id="answer_submit_delay" type="number" min="0" max="60" step="1"></div>
                 <div class="form-item"><label>答题提交方式：</label><select id="answer_submit_mode"><option value="manual">填写后手动提交（推荐）</option><option value="auto">自动提交</option></select></div>
                 <div class="form-item"><label><input id="answer_review" type="checkbox" aria-describedby="answer_review_notice">AI 二次核对（额外一次请求，答案不一致时停止）</label></div>
@@ -702,7 +703,7 @@
                 <button id="btn-clear">清除缓存</button>
                 <button id="btn-start">开始刷课</button>
                 <button id="btn-stop">停止刷课</button>
-                <button id="btn-export-log">导出日志</button>
+                <button id="btn-export-log">日志 / 诊断</button>
                 <button id="btn-reload">重新加载</button>
               </div>
             </div>
@@ -833,16 +834,7 @@
     hostWindow.addEventListener('pagehide', () => clearInterval(expiryTimer), { once: true });
     ui.btnExportLog.onclick = () => {
       pruneLog();
-      const text = RuntimeLog.exportText(runtimeEntries);
-      const blob = new Blob(['\uFEFF', text], { type: 'text/plain;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const link = doc.createElement('a');
-      link.href = url;
-      link.download = 'yuketang-runtime-' + new Date().toISOString().replace(/[:.]/g, '-') + '.log';
-      doc.body.appendChild(link);
-      link.click(); link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      log('已导出当前保留的运行日志');
+      Diagnostic.show(hostWindow.document || document, runtimeEntries, () => doc.getElementById('question_preview_image')?.src || '', log);
     };
 
     const defaultAI = { url: 'https://api.deepseek.com/chat/completions', key: 'sk-xxxxxxx', model: 'deepseek-chat', apiFormat: 'openai', authMethod: 'bearer' };
@@ -1637,6 +1629,86 @@
   }
 
   // ---- OCR & AI ----
+  // 仅收集操作结构和状态，不导出 DOM 正文、表单值、配置、存储或网络请求。
+  const Diagnostic = {
+    redact(text) {
+      return Utils.safeError(String(text)).replace(/https?:\/\/[^\s<>"']+/g, '[页面地址已隐藏]')
+        .replace(/(?:开始处理作业|AI 第\d次答案|填空答案|识别题目文字)[^\n]*/g, '[课程或答案内容已隐藏]')
+        .replace(/(?:Bearer\s+|sk-)[A-Za-z0-9._-]+/gi, '[认证信息已隐藏]')
+        .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[邮箱已隐藏]')
+        .replace(/\b\d{7,}\b/g, '[标识已隐藏]');
+    },
+    collect(entries, pageDocument = document) {
+      const docs = [{ name: '学习页面', doc: pageDocument }];
+      const exerciseDoc = AiWorkspace.getExerciseDocument?.();
+      if (exerciseDoc && exerciseDoc !== pageDocument) docs.push({ name: '作业内页', doc: exerciseDoc });
+      const allowedText = /^(?:已发言|未发言|已完成|未完成|已读|未读|已提交|未提交|进行中|上一题|下一题|提交(?:\s*[（(]剩余\s*\d+\s*次[）)])?|发表|发送|开始|暂停|播放|\d{1,3}|完成度\s*\d+(?:\.\d+)?%)$/;
+      const pages = docs.map(({ name, doc }) => {
+        const candidates = [...doc.querySelectorAll('button, input, textarea, select, [contenteditable], [role="button"], .learning-space-control-unit .control-right > div, .rate-detail .text, .progress-wrap .text, .nav-item-leaf-box, .nav-item-leaf-box i, .leaf-item, .leaf-item i, .activity__wrap, .subject-item, .container-problem, .el-radio, .el-checkbox, .geetest_panel, .yidun_popup, .captcha-dialog, .el-dialog, [role="dialog"], video, audio')];
+        const elements = candidates.filter(node => !node.closest?.('#ykt-helper-iframe, #ykt-diagnostic-dialog')).slice(0, 500).map(node => {
+          const rect = node.getBoundingClientRect();
+          const text = String(node.innerText || '').trim();
+          return { tag: String(node.tagName || ''),
+            // 动态编号和非标准类名不保留，避免账号标识混入结构。
+            classes: String(node.className || '').split(/\s+/).filter(value => /^[a-zA-Z_-][a-zA-Z_-]{0,60}$/.test(value)).slice(0, 12),
+            type: /^(button|submit|radio|checkbox|text|number|password)$/.test(node.type) ? node.type : undefined,
+            text: allowedText.test(text) ? text : undefined,
+            visible: AiWorkspace.isVisibleElement(node), disabled: Boolean(node.disabled), checked: Boolean(node.checked),
+            size: { width: Math.round(rect.width), height: Math.round(rect.height) } };
+        });
+        return { name, candidateCount: candidates.length, truncated: candidates.length > 500, elements };
+      });
+      const media = AiWorkspace.getMedia();
+      const finite = value => Number.isFinite(value) ? value : null;
+      return { format: 'yuketang-diagnostic-1', version: Config.version, exportedAt: new Date().toISOString(),
+        notice: '默认脱敏仍不能保证无个人信息，请检查后自行决定是否上传；脚本不会自动上传。',
+        routeType: AiWorkspace.getRoute()?.type || '其他',
+        media: media ? { currentTime: finite(media.currentTime), duration: finite(media.duration), rate: finite(media.playbackRate), paused: media.paused, ended: media.ended, muted: media.muted, progress: AiWorkspace.getCurrentMediaProgress() ?? null } : null,
+        pages, logs: entries.map(entry => this.redact(entry.node.innerText || '')) };
+    },
+    download(doc, text, extension, prefix) {
+      const blob = new Blob(['\uFEFF', text], { type: extension === 'json' ? 'application/json;charset=utf-8' : 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob), link = doc.createElement('a');
+      link.href = url; link.download = prefix + new Date().toISOString().replace(/[:.]/g, '-') + '.' + extension;
+      doc.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
+    show(doc, entries, screenshot, log) {
+      if (doc.getElementById('ykt-diagnostic-dialog')) return;
+      const overlay = doc.createElement('div'); overlay.id = 'ykt-diagnostic-dialog';
+      overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:#0006;display:flex;align-items:center;justify-content:center';
+      overlay.innerHTML = `<section role="dialog" aria-modal="true" aria-label="日志与诊断" style="background:white;color:#222;padding:20px;width:420px;max-width:90vw;max-height:85vh;overflow:auto;border-radius:10px;box-sizing:border-box;font:14px sans-serif">
+        <h3 style="margin-top:0">日志 / 诊断</h3>
+        <p>诊断包可能含课程及个人信息，请检查后自行决定是否上传。脚本不会自动上传。</p>
+        <details><summary>查看说明</summary><p>普通日志可能含课程名称和 AI 答案。诊断包额外包含当前操作元素及播放器状态，不包含表单值、页面正文、Cookie 或存储配置，并对日志做脱敏。公开上传后可能被他人查看、复制和保存。</p><p>截图仅附带助手最近一次识题截图，可能来自上一道题，不代表整个页面；图片不自动脱敏，请检查其中的个人信息。</p></details>
+        <p><label><input type="checkbox" data-action="image">附带最近题目截图（可选）</label></p>
+        <p data-action="status" role="status"></p>
+        <button data-action="log">导出日志</button> <button data-action="diagnostic">导出诊断包</button> <button data-action="close">关闭</button>
+      </section>`;
+      doc.body.appendChild(overlay);
+      const status = overlay.querySelector('[data-action="status"]');
+      overlay.querySelector('[data-action="close"]').onclick = () => overlay.remove();
+      overlay.querySelector('[data-action="log"]').onclick = () => {
+        this.download(doc, RuntimeLog.exportText(entries), 'log', 'yuketang-runtime-');
+        status.textContent = '已导出日志，请检查后再发送。'; log('已导出当前保留的运行日志');
+      };
+      overlay.querySelector('[data-action="diagnostic"]').onclick = () => {
+        try {
+          const data = this.collect(entries);
+          if (overlay.querySelector('[data-action="image"]').checked) {
+            const image = screenshot();
+            if (!/^data:image\/(jpeg|png);base64,/.test(image || '') || image.length > 8 * 1024 * 1024) {
+              status.textContent = '没有可用的题目截图，请取消截图选项或先完成识题。'; return;
+            }
+            data.recentQuestionScreenshot = image;
+          }
+          this.download(doc, JSON.stringify(data, null, 2), 'json', 'yuketang-diagnostic-');
+          status.textContent = '已导出诊断包，请检查后再发送。'; log('已导出诊断包到本地，未上传');
+        } catch (err) { status.textContent = '诊断导出失败：' + Utils.safeError(err); }
+      };
+    }
+  };
+
   const RuntimeLog = {
     exportText(entries) {
       return '雨课堂助手运行日志\n版本：' + Config.version + '\n导出时间：' + new Date().toLocaleString('zh-CN')
@@ -3010,8 +3082,15 @@
       } finally { stop(); }
     }
     async solveExerciseQuestion(root, label = '') {
+      Solver.assertNoVerification();
       if (AiWorkspace.isExerciseAnswered(root)) {
-        this.panel.log((label || '当前题目') + ' 已提交，跳过 AI 请求和填写');
+        // 跳过也受答题节奏约束；至少等3秒，并在等待中持续检查验证和取消。
+        const seconds = Math.max(3, Store.getAnswerConf().intervalSeconds);
+        this.panel.log((label || '当前题目') + ' 已提交，跳过 AI 请求和填写；等待 ' + seconds + ' 秒再继续');
+        for (let remaining = seconds * 1000; remaining > 0; remaining -= 500) {
+          await Utils.sleep(Math.min(500, remaining));
+          Solver.assertNoVerification();
+        }
         return { ok: true, status: 'already_answered' };
       }
       const result = await Solver.solve(AiWorkspace.getExerciseQuestionBody(root));
@@ -3025,8 +3104,10 @@
       const nextBtn = AiWorkspace.getExerciseActionButton(currentRoot, /下一题|下一道|下一步/);
       if (!nextBtn) return false;
       if (nextBtn.disabled || nextBtn.classList.contains('is-disabled')) return false;
+      Solver.assertNoVerification();
       nextBtn.click();
       return Utils.requirePoll(() => {
+        Solver.assertNoVerification();
         const latestRoot = AiWorkspace.getExerciseContainer() || currentRoot;
         const questionRoot = AiWorkspace.getExerciseQuestionBody(latestRoot);
         const fingerprint = AiWorkspace.normalizeText(questionRoot?.innerText || '').slice(0, 120);
@@ -3035,6 +3116,7 @@
     }
 
     async handleExercise(route) {
+      Solver.assertNoVerification();
       const featureFlags = Store.getFeatureConf();
       if (!featureFlags.autoAI) {
         this.panel.log('已关闭 AI 自动答题，作业将直接跳过');
@@ -3053,12 +3135,14 @@
       if (tabs.length) {
         this.panel.log(`检测到题目索引 ${tabs.length} 个，按题号顺序作答`);
         for (let i = 0; i < tabs.length; i++) {
+          Solver.assertNoVerification();
           const currentRoot = AiWorkspace.getExerciseContainer() || root;
           const currentTabs = AiWorkspace.getExerciseQuestionTabs(currentRoot);
           const currentTab = currentTabs[i];
           if (!currentTab) throw new Error('题号列表发生变化');
           currentTab.click();
           await Utils.sleep(1200);
+          Solver.assertNoVerification();
           await this.solveExerciseQuestion(AiWorkspace.getExerciseContainer() || currentRoot, `第 ${i + 1} 题`);
         }
         return true;
