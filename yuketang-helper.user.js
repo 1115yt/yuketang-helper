@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      4.0.5
+// @version      4.0.6
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       1115yt
 // @license      GPL3
@@ -38,7 +38,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '4.0.5',     // 版本号
+    version: '4.0.6',     // 版本号
     playbackRate: 1,      // 视频播放倍速
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -1600,10 +1600,20 @@
     },
     isExerciseAnswered(root = this.getExerciseContainer()) {
       if (!root) return false;
-      const nodes = root.querySelectorAll('.result, .answer-status, .status, [class*="result"], [class*="answer-status"]');
-      return [...nodes].some(el => this.isVisibleElement(el) &&
+      // 提交按钮与题目正文可能不在同一个节点，仅检查当前题目容器。
+      const scope = root.closest?.('.container-problem') || root;
+      const statusSelector = '.result, .answer-status, .status, [class*="result"], [class*="answer-status"]';
+      const nodes = [...root.querySelectorAll(statusSelector), ...scope.querySelectorAll(statusSelector)];
+      if ([...nodes].some(el => this.isVisibleElement(el) &&
         /已完成|已作答|已提交|回答正确|回答错误/.test(this.normalizeText(el.innerText)) &&
-        !/未完成|未作答|未提交/.test(this.normalizeText(el.innerText)));
+        !/未完成|未作答|未提交/.test(this.normalizeText(el.innerText)))) return true;
+      // 已提交按钮即使禁用也属于平台反馈，不要求它可点击。
+      if ([...scope.querySelectorAll('button, .el-button, [role="button"]')]
+        .some(el => this.isVisibleElement(el) && this.normalizeText(el.innerText) === '已提交')) return true;
+      const feedback = [...scope.querySelectorAll('p, span, div')]
+        .filter(el => this.isVisibleElement(el)).map(el => this.normalizeText(el.innerText));
+      return feedback.some(text => /^本题得分\s*[:：]\s*\d+(?:\.\d+)?$/.test(text))
+        && feedback.some(text => /^正确答案\s*[:：]\s*\S+/.test(text));
     },
     getExerciseActionButton(root = this.getExerciseContainer(), pattern = /提交|保存|确认|确定|下一题|下一道|下一步|完成本题/) {
       if (!root) return null;
@@ -2002,6 +2012,7 @@
       return { ok: true, blanks: value.blanks.map(item => item.trim()) };
     },
     async fillBlanksAndSubmit(text, root) {
+      if (AiWorkspace.isExerciseAnswered(root)) return { ok: true, status: 'already_answered' };
       this.assertNoVerification();
       const inputs = this.getBlanks(root), parsed = this.parseBlankAnswer(text, inputs.length);
       if (!inputs.length || !parsed.ok) return parsed.ok ? this.failure('blanks_missing', '未找到填空输入框') : parsed;
@@ -2033,8 +2044,10 @@
       panel.log('开始答题前等待 ' + conf.intervalSeconds + ' 秒');
       await Utils.sleep(conf.intervalSeconds * 1000);
       this.assertNoVerification();
+      if (AiWorkspace.isExerciseAnswered(root)) return { ok: true, status: 'already_answered' };
       const ocr = conf.inputMode === 'image' ? await this.captureQuestion(root) : await this.recognize(root);
       if (!ocr.ok) return ocr;
+      if (AiWorkspace.isExerciseAnswered(root)) return { ok: true, status: 'already_answered' };
       if (kind === 'blank') {
         panel.log('识别到填空题，共 ' + blanks.length + ' 个空');
         const ai = await this.askAI(ocr.text, blanks.length, false, 'blank', ocr.image);
@@ -2087,8 +2100,8 @@
   const Discussion = {
     isCompletedStatus(text) {
       const status = AiWorkspace.normalizeText(text || '');
-      return !/未完成|未提交|未读|未开始|进行中/.test(status)
-        && (Utils.isProgressDone(status) || status.includes('已读'));
+      return !/未完成|未提交|未读|未发言|未开始|进行中/.test(status)
+        && (Utils.isProgressDone(status) || /已读|已发言/.test(status));
     },
     isCurrentCompleted() {
       // 仅检查当前单元的状态，不能用整门课程或其他讨论的状态判断。
@@ -2189,6 +2202,11 @@
           return Boolean(text);
         }, { interval: 400, timeout: 15000 });
         if (!text) return Solver.failure('comment_empty', '讨论区没有可复制的回答');
+        // 页面状态可能在等待评论加载时才更新；填写前再次核对。
+        if (this.isCurrentCompleted()) {
+          panel.log('当前讨论已完成／已读／已发言，跳过；未填写或发表评论');
+          return { ok: true, status: 'already_completed' };
+        }
         panel.log('讨论处理：已读取已有回答，正在填写输入框');
         Task.check();
         const view = editor.ownerDocument?.defaultView || window;
@@ -2208,6 +2226,11 @@
           button = this.sendButton(doc, editor);
           return Boolean(button);
         }, { interval: 200, timeout: 5000 });
+        // 发送控件等待期间若平台已确认完成，则停止发送。
+        if (this.isCurrentCompleted()) {
+          panel.log('当前讨论已完成／已读／已发言，停止发送；未发表评论');
+          return { ok: true, status: 'already_completed' };
+        }
         const useEnter = !enabled && this.canSendWithEnter(editor);
         if (!enabled && !useEnter) return Solver.failure('comment_button', '讨论发送按钮不存在或不可用，且未识别到主发表区的 Enter 发送提示');
         const matchingCount = () => this.comments(doc).filter(el => (el.innerText || '').trim() === text).length;
@@ -2981,6 +3004,10 @@
       } finally { stop(); }
     }
     async solveExerciseQuestion(root, label = '') {
+      if (AiWorkspace.isExerciseAnswered(root)) {
+        this.panel.log((label || '当前题目') + ' 已提交，跳过 AI 请求和填写');
+        return { ok: true, status: 'already_answered' };
+      }
       const result = await Solver.solve(AiWorkspace.getExerciseQuestionBody(root));
       Solver.requireResult(result);
       this.panel.log((label || '当前题目') + ' 已确认作答');

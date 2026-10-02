@@ -1,8 +1,8 @@
-# v4.0.5 更新说明
+# v4.0.6 更新说明
 
 本项目基于 [Niuwh/yuketang-jiaoben](https://github.com/Niuwh/yuketang-jiaoben) 修改维护。上游 main 分支的 [原脚本](https://github.com/Niuwh/yuketang-jiaoben/blob/main/yuketang.js) 标注版本 3.0.6、作者“风之子”和 GPL3。当前修改维护账号为 1115yt；上游作者与历史贡献者仍归属原项目。
 
-本版修复已读或已完成的讨论仍重复进入回复流程的问题，并将脚本版本递增至 4.0.5，供 Tampermonkey 识别更新。
+本版补充讨论“已发言”的完成状态识别，并在填写前、发送前再次检查平台状态，防止等待页面加载时重复进入回复流程。作业支持识别当前题目禁用的“已提交”按钮，以及得分与正确答案反馈，在请求 AI 前跳过已提交题目，等待期间重新检查提交状态。脚本版本递增至 4.0.6，供 Tampermonkey 识别更新。
 
 ## 本版功能
 
