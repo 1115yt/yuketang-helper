@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      4.0.9
+// @version      4.0.10
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       1115yt
 // @license      GPL3
@@ -38,7 +38,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '4.0.9',     // 版本号
+    version: '4.0.10',     // 版本号
     playbackRate: 1,      // 视频播放倍速
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -355,6 +355,27 @@
     },
     clearPendingAutoStart() {
       localStorage.removeItem(Config.storageKeys.pendingAutoStart);
+    },
+    prepareDirectoryReturn(targetWindow, returnUrl) {
+      const pending = this.getPendingAutoStart();
+      const safeUrl = Utils.getSafeReturnUrl(returnUrl);
+      if (!pending || !safeUrl || pending.returnUrl !== safeUrl) throw new Error('返回目录接续状态失效，请手动开始');
+      Task.check();
+      // 标记只交给即将返回的窗口；目录加载后消费一次，普通刷新不能重复启动。
+      targetWindow.name = 'ykt-helper-return:' + JSON.stringify({ origin: location.origin,
+        classroomId: pending.classroomId, returnUrl: safeUrl, ts: Date.now() });
+    },
+    consumeDirectoryReturn() {
+      const name = String(window.name || '');
+      if (!name.startsWith('ykt-helper-return:')) return false;
+      window.name = '';
+      const marker = Utils.safeJSONParse(name.slice('ykt-helper-return:'.length), null);
+      const pending = this.getPendingAutoStart();
+      const elapsed = Date.now() - marker?.ts;
+      return Boolean(marker && pending && marker.origin === location.origin
+        && marker.classroomId === Utils.getCurrentClassroomId() && pending.classroomId === marker.classroomId
+        && Utils.getSafeReturnUrl(marker.returnUrl) === Utils.getSafeReturnUrl(location.href)
+        && pending.returnUrl === marker.returnUrl && elapsed >= 0 && elapsed < 30000);
     },
   };
 
@@ -3049,6 +3070,7 @@
       const sourceWindow = this.getSourceWindow();
       if (sourceWindow) {
         try {
+          Store.prepareDirectoryReturn(sourceWindow, returnUrl);
           sourceWindow.location.href = returnUrl;
           sourceWindow.focus();
           window.close();
@@ -3060,6 +3082,7 @@
       const safeUrl = Utils.getSafeReturnUrl(returnUrl);
       if (!safeUrl) throw new Error('返回目录地址无效');
       Task.check();
+      Store.prepareDirectoryReturn(window, safeUrl);
       location.assign(safeUrl);
       return true;
     }
@@ -3313,6 +3336,11 @@
         const marker = Utils.safeJSONParse(event.oldValue, null);
         if (event.newValue === null && marker?.classroomId === classId) Task.finish();
       });
+      if (Store.consumeDirectoryReturn()) {
+        panel.log('接续本次任务返回的课程目录，继续查找未完成内容');
+        panel.start();
+        return;
+      }
       // 单次新窗口接续：验证同源 opener、课堂和短时标记，先消费再启动。
       const handoffName = String(window.name || '');
       if (handoffName.startsWith('ykt-helper-handoff:')) {
