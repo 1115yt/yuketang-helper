@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂刷课助手
 // @namespace    http://tampermonkey.net/
-// @version      4.0.8
+// @version      4.0.9
 // @description  针对雨课堂视频进行自动播放，配置AI自动答题
 // @author       1115yt
 // @license      GPL3
@@ -38,7 +38,7 @@
 
   // ---- 脚本配置，用户可修改 ----
   const Config = {
-    version: '4.0.8',     // 版本号
+    version: '4.0.9',     // 版本号
     playbackRate: 1,      // 视频播放倍速
     pptInterval: 3000,    // ppt翻页间隔
     storageKeys: {        // 使用者勿动
@@ -1568,6 +1568,22 @@
         return text && text.length <= 20;
       });
     },
+    getActiveExerciseQuestionIndex(root = this.getExerciseContainer()) {
+      const tabs = this.getExerciseQuestionTabs(root);
+      return tabs.findIndex(tab => tab.classList?.contains('active')
+        || tab.getAttribute?.('aria-current') === 'true'
+        || tab.getAttribute?.('aria-selected') === 'true');
+    },
+    isExerciseQuestionMarked(index, root = this.getExerciseContainer()) {
+      const tab = this.getExerciseQuestionTabs(root)[index];
+      // 诊断页出现 primary 题号样式；只作为候选状态变化，仍需答案锁定或下一题等联合证据。
+      return Boolean(tab && ['primary', 'answered', 'submitted'].some(name => tab.classList?.contains(name)));
+    },
+    getExerciseQuestionNumber(root = this.getExerciseContainer()) {
+      const text = this.normalizeText(root?.querySelector('.item-type')?.innerText || '');
+      const match = text.match(/^(\d+)\s*[.．、]/);
+      return match ? Number(match[1]) : null;
+    },
     getExerciseQuestionBody(root = this.getExerciseContainer()) {
       if (!root) return null;
       const itemType = root.querySelector('.item-type');
@@ -1611,10 +1627,10 @@
       if (!root) return null;
       const selectors = 'button, .el-button, [role="button"], [class*="button"]';
       const nodes = [
-        ...root.querySelectorAll(selectors),
-        ...document.querySelectorAll(selectors)
+        ...root.querySelectorAll(selectors)
       ];
-      return nodes.find(el => this.isVisibleElement(el) && pattern.test(this.normalizeText(el.innerText)));
+      return nodes.find(el => this.isVisibleElement(el) && !el.closest?.('[data-automation-risk-decoys], [data-risk-target="decoy"]')
+        && pattern.test(this.normalizeText(el.innerText)));
     },
     getAllScourse() { // 获得ai-workspace的课程列表
       const list = document?.querySelectorAll(".nav-item-leaf-box")
@@ -2021,14 +2037,39 @@
     async submitPrepared(questionRoot, unchanged, metadata = {}) {
       const feedbackRoot = questionRoot.closest?.('.subject-item') || questionRoot;
       const conf = Store.getAnswerConf();
+      const initialRoot = AiWorkspace.getExerciseContainer();
+      const initialIndex = AiWorkspace.getActiveExerciseQuestionIndex(initialRoot);
+      const initialNumber = AiWorkspace.getExerciseQuestionNumber(initialRoot);
+      const initiallyMarked = AiWorkspace.isExerciseQuestionMarked(initialIndex, initialRoot);
+      const initialDocument = initialRoot?.ownerDocument;
+      let advancedAfterSubmit = false;
+      const hasSubmissionFeedback = () => {
+        const latestRoot = AiWorkspace.getExerciseContainer();
+        const index = AiWorkspace.getActiveExerciseQuestionIndex(latestRoot);
+        const sameQuestion = initialIndex >= 0 ? index === initialIndex
+          : questionRoot.isConnected || (initialNumber !== null && AiWorkspace.getExerciseQuestionNumber(latestRoot) === initialNumber);
+        if (sameQuestion && AiWorkspace.isExerciseAnswered(questionRoot.isConnected ? feedbackRoot : latestRoot)) return true;
+        // 题号移动或按钮禁用都不足以确认。原题必须新出现作答标记，同时已锁定答案或切到下一题。
+        const newlyMarked = initialIndex >= 0 && !initiallyMarked && latestRoot
+          && latestRoot.ownerDocument === initialDocument
+          && AiWorkspace.isExerciseQuestionMarked(initialIndex, latestRoot);
+        if (!newlyMarked) return false;
+        const controls = [...(latestRoot.querySelectorAll('input[type="radio"], input[type="checkbox"], input.blank-item-dynamic, input[placeholder="输入答案"], textarea[data-blank-index]') || [])]
+          .filter(el => AiWorkspace.isVisibleElement(el) && !el.closest?.('[data-automation-risk-decoys], [data-risk-target="decoy"]'));
+        const locked = controls.length > 0 && controls.every(el => el.disabled || el.readOnly);
+        advancedAfterSubmit = index === initialIndex + 1;
+        return advancedAfterSubmit || (sameQuestion && locked);
+      };
       if (!conf.autoSubmit) {
         panel.log('答案已填写，等待你核对并手动提交当前题（最多10分钟）；脚本不会点击提交');
         const confirmed = await Utils.poll(() => {
           this.assertNoVerification();
-          if (!questionRoot.isConnected) throw new Error('等待手动提交期间题目已切换，停止并请核对');
-          return AiWorkspace.isExerciseAnswered(feedbackRoot);
+          if (hasSubmissionFeedback()) return true;
+          if (!questionRoot.isConnected) throw new Error('等待手动提交期间题目已切换，但未确认原题提交，停止并请核对');
+          return false;
         }, { interval: 500, timeout: 600000 });
         if (!confirmed) return this.failure('manual_unconfirmed', '未确认手动提交结果，停止并保留当前题');
+        if (advancedAfterSubmit) return { ok: true, status: 'submitted_advanced', ...metadata, grade: 'ungraded' };
         if (!unchanged()) {
           panel.log('当前题由人工修改后提交，不计入 AI 答案正确率');
           return { ok: true, status: 'manual_submitted', grade: 'manual_changed' };
@@ -2060,12 +2101,15 @@
         }
         // 容器被替换时不读取另一题的结果，保留未确认状态供人工核对。
         const current = questionRoot.isConnected ? feedbackRoot : null;
-        if (!current) return false;
-        const error = current.querySelector('.error, .el-form-item__error, [class*="submit-error"]');
+        const error = current?.querySelector('.error, .el-form-item__error, [class*="submit-error"]');
         if (error && AiWorkspace.isVisibleElement(error) && /失败|错误|请选择/.test(error.innerText || '')) throw new Error('页面反馈提交失败');
-        return AiWorkspace.isExerciseAnswered(current);
+        return hasSubmissionFeedback();
       }, { interval: 300, timeout: 15000 });
       if (!confirmed) return this.failure('submit_unconfirmed', '提交后未出现本题作答反馈，停止并请人工确认；不会自动重提');
+      if (advancedAfterSubmit) {
+        panel.log('提交后平台已自动切换到下一题；本题未显示判分反馈，不计入正确率');
+        return { ok: true, status: 'submitted_advanced', ...metadata, grade: 'ungraded' };
+      }
       return { ok: true, status: 'submitted', ...metadata, grade: this.recordGrade(feedbackRoot) };
     },
     getBlanks(root, includeLocked = false) {
@@ -3105,13 +3149,15 @@
       if (!nextBtn) return false;
       if (nextBtn.disabled || nextBtn.classList.contains('is-disabled')) return false;
       Solver.assertNoVerification();
+      // 以点击前的正文为基准，防止刚出现的得分反馈被误认为已经换题。
+      const beforeClick = AiWorkspace.normalizeText(AiWorkspace.getExerciseQuestionBody(currentRoot)?.innerText || '').slice(0, 120) || previousFingerprint;
       nextBtn.click();
       return Utils.requirePoll(() => {
         Solver.assertNoVerification();
         const latestRoot = AiWorkspace.getExerciseContainer() || currentRoot;
         const questionRoot = AiWorkspace.getExerciseQuestionBody(latestRoot);
         const fingerprint = AiWorkspace.normalizeText(questionRoot?.innerText || '').slice(0, 120);
-        return fingerprint && fingerprint !== previousFingerprint;
+        return fingerprint && fingerprint !== beforeClick;
       }, { interval: 500, timeout: 5000 }, '点击下一题后题目未发生变化');
     }
 
@@ -3140,8 +3186,16 @@
           const currentTabs = AiWorkspace.getExerciseQuestionTabs(currentRoot);
           const currentTab = currentTabs[i];
           if (!currentTab) throw new Error('题号列表发生变化');
-          currentTab.click();
+          if (AiWorkspace.getActiveExerciseQuestionIndex(currentRoot) !== i) currentTab.click();
           await Utils.sleep(1200);
+          await Utils.requirePoll(() => {
+            Solver.assertNoVerification();
+            const latest = AiWorkspace.getExerciseContainer();
+            if (!latest) return false;
+            const active = AiWorkspace.getActiveExerciseQuestionIndex(latest);
+            const number = AiWorkspace.getExerciseQuestionNumber(latest);
+            return (active < 0 || active === i) && (number === null || number === i + 1);
+          }, { interval: 300, timeout: 10000 }, `第 ${i + 1} 题尚未加载，停止以免重复处理上一题`);
           Solver.assertNoVerification();
           await this.solveExerciseQuestion(AiWorkspace.getExerciseContainer() || currentRoot, `第 ${i + 1} 题`);
         }
